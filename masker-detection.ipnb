@@ -1,0 +1,270 @@
+import tensorflow as tf
+import numpy as np
+import matplotlib.pyplot as plt
+import cv2
+
+def dataset_pipeline(path, batch_size=32, training=False):
+    AUTO = tf.data.experimental.AUTOTUNE
+
+    data_files = tf.data.Dataset.list_files(path, shuffle=training)
+    dataset = tf.data.TFRecordDataset(data_files, num_parallel_reads=1)       
+    dataset = dataset.map(parser_fn, num_parallel_calls=AUTO)
+
+    dataset = dataset.map(augment(training=training), num_parallel_calls=AUTO)
+    if training:
+        dataset = dataset.prefetch(1024).shuffle(3200).batch(batch_size).repeat()
+    else:
+        dataset = dataset.batch(batch_size)
+    
+    return dataset
+
+def parser_fn(example):
+    features_format = {
+        'filename': tf.io.FixedLenFeature((), tf.string, default_value=''),
+        'encoded': tf.io.FixedLenFeature((), tf.string, default_value=''),
+        'height': tf.io.FixedLenFeature([], tf.int64),
+        'width': tf.io.FixedLenFeature([], tf.int64),
+        'label': tf.io.FixedLenFeature([], tf.int64),
+    }
+
+    features = tf.io.parse_single_example(example, features_format)
+    
+    height = tf.cast(features['height'], tf.int32)
+    width = tf.cast(features['width'], tf.int32)
+    image_shape = tf.stack([height, width, 3])
+
+    image = tf.image.decode_image(features['encoded'], channels=3)
+    image = tf.reshape(image, image_shape)
+
+def augment(size=64, training=True):
+    def impl(image, label):
+        image = tf.cast(image, tf.float32)
+        
+        if training:
+            image = tf.image.random_flip_left_right(image)    
+
+            pad = 20
+
+            image = tf.image.resize(image, [size,size])
+            image = tf.image.resize_with_crop_or_pad(image, size+pad, size+pad)
+            image = tf.image.random_crop(image, [size, size, 3])
+        else:
+            image = tf.image.resize(image, [size,size])
+
+        image = image/255.
+
+        return image, label
+    return impl
+
+    n = 4
+    dataset = dataset_pipeline(['mask-train.tfrecord'], batch_size=32, training=True)
+    for i,(x,y) in dataset.enumerate():
+        print(i.numpy(), x.shape, y.shape, y[:n].numpy())
+        if i==10:
+            break
+
+    fig = plt.figure(figsize=(20,20))
+    idxs = np.arange(x.shape[0])
+    for i in range(n):
+        idx = idxs[i]
+        fig.add_subplot(1,n,i+1)
+        plt.imshow(x[idx])
+
+def create_model(n_class = 2, learning_rate = 1e-3,input_shape = [64,64,3], pretrained=False):
+    weights = None
+    if pretrained:
+        weights = 'imagenet'
+    backbone = tf.keras.applications.VGG16(weights=weights, input_shape=input_shape, include_top=False)
+    
+    model = tf.keras.models.Sequential([
+        backbone,
+        tf.keras.layers.Flatten(),
+        tf.keras.layers.Dropout(0.45),
+        tf.keras.layers.Dense(128, activation='relu'),
+        tf.keras.layers.Dropout(0.45),
+        tf.keras.layers.Dense(n_class, activation='softmax', name='classifier')
+    ])
+
+    sgd = tf.keras.optimizers.SGD(learning_rate=learning_rate, momentum=0.9, nesterov=True)
+    model.compile(optimizer=sgd, loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+
+    return model
+  
+    model = create_model(2, pretrained=True,learning_rate=5e-4)
+
+    all_callbacks = [
+        tf.keras.callbacks.ModelCheckpoint('trained_model', monitor='val_loss'),
+        tf.keras.callbacks.TensorBoard('training_logs'),
+        tf.keras.callbacks.EarlyStopping(monitor='val_loss',patience=5, restore_best_weights=True),        
+    ]
+
+    train_data = dataset_pipeline('mask-train.tfrecord', batch_size=32, training=True)
+    val_data = dataset_pipeline('mask-val.tfrecord', batch_size=32, training=False)
+    training_log = model.fit(train_data, steps_per_epoch=30, epochs=20, validation_data=val_data, callbacks=all_callbacks)
+
+
+def load_s3fd(frozen_graph_filename,  name="", graph=None):
+    # We load the protobuf file from the disk and parse it to retrieve the 
+    # unserialized graph_def
+    with tf.io.gfile.GFile(frozen_graph_filename, "rb") as f:
+        graph_def = tf.compat.v1.GraphDef()
+        graph_def.ParseFromString(f.read())
+        
+    # Then, we import the graph_def into a new Graph and returns it 
+    if graph is None:
+        graph = tf.Graph() 
+    with graph.as_default():
+        
+        tf.graph_util.import_graph_def(graph_def, name=name)
+    return graph
+
+def s3fd(frozen_model = 's3fd.pb', sess=None):
+    tf.compat.v1.reset_default_graph()
+    
+    if sess is None:
+        sess = tf.compat.v1.Session()
+
+    graph = load_s3fd(frozen_model, graph=tf.compat.v1.get_default_graph())
+                                                                      
+    def det_func(img): 
+        outputs={}
+        output_tensors = ('S3FD_slim/outputs/scores:0', 
+                          'S3FD_slim/outputs/bboxes:0')
+        if len(img.shape)==3:
+            img = np.expand_dims(img, axis=0)
+        outputs['scores'], outputs['bboxes'] = sess.run(output_tensors, {'S3FD/inputs:0': img})
+        return outputs
+    return det_func
+
+def resize_with_pad(img, shape=[640,640]):
+    w,h = shape
+
+    im_h,im_w,_ = img.shape
+    factor = float(w)/im_w
+
+    new_w, new_h = (int(im_w*factor), int(im_h*factor))
+
+    out = np.zeros(shape=[h,w,3], dtype=np.uint8)
+    if new_h<h: #pad vertical
+        pad = int((h-new_h)/2)
+
+        resized = cv2.resize(img, (new_w, new_h))
+        out[pad:pad+new_h,:,:] = resized
+    else: #pad_horizontal
+        factor = float(h)/im_h
+        new_w, new_h = (int(im_w*factor), int(im_h*factor))   
+        pad = int((w-new_w)/2)   
+
+        resized = cv2.resize(img, (new_w, new_h))
+        out[:,pad:pad+new_w,:] = resized
+
+    return cv2.resize(out, (w,h))
+
+from collections import namedtuple
+Prediction = namedtuple('Prediction', ['score','bbox','masker'])
+def prediction_formatting(scores, bboxes):
+    predictions = []
+    
+    for j in range(bboxes.shape[0]):
+        y1,x1,y2,x2 = bboxes[j]
+        if (x2-x1>.0) and(y2-y1>0.) and scores[j]>0:
+            predictions.append(Prediction(scores[j], [x1,y1,x2,y2],2))
+            
+    return predictions
+
+def visualize(img, objects, min_score=0.1, masked=None):
+    out = img.copy()
+    im_h, im_w, _ = img.shape
+
+    masker = ['polos', 'masker', 'background']
+    masker_color = [(255,0,0), (0,255,0),(0,0,0)]
+    label_color = [(255,255,255), (0,0,0),(255,255,255)]
+    
+    
+    cnt = 0
+    for obj in objects:
+        if obj.score<min_score:
+            continue
+        x1,y1,x2,y2 = obj.bbox
+        
+        #convert to absolute
+        x1 = int(x1*im_w)
+        y1 = int(y1*im_h)
+        x2 = int(x2*im_w)
+        y2 = int(y2*im_h)
+            
+        w = x2-x1
+        h = y2-y1
+        
+        c = (0,255,0)
+        
+        if masked is not None:
+            mask_label = masked[cnt]
+            c = masker_color[mask_label]
+            out = cv2.rectangle(out,(x1,y1-10),(x2,y1),c,2)
+            out = cv2.rectangle(out,(x1,y1-10),(x2,y1),c,-1)
+            cv2.putText(out, masker[mask_label], (x1,max(10,y1-4)),  cv2.FONT_HERSHEY_SIMPLEX,0.4, label_color[mask_label])
+        out = cv2.rectangle(out,(x1,y1),(x2,y2),c,2)
+
+        cnt+=1
+            
+    return out
+
+def masker(classifier, img, faces, min_score=0.7):
+    masked_faces = []
+    im_h, im_w, _ = img.shape
+
+    for face in faces:
+        if face.score<min_score:
+            masked_faces.append(2)
+            continue
+        
+        x1,y1,x2,y2 = face.bbox
+        y1,y2 = int(y1*im_h), int(y2*im_h)
+        x1,x2 = int(x1*im_w), int(x2*im_w)
+
+        cx = int((x1+x2)/2)
+        cy = int((y1+y2)/2)
+        cw,ch = x2-x1, y2-y1
+
+        max_side = max(cw,ch)
+        crop_len = int(max_side*1.2)
+
+        dx = int((crop_len-cw)/2)
+        dy = int((crop_len-ch)/2)
+
+        y1 = max(y1-int(dy/2),0)
+        y2 = min(y2+int(dy/2),im_h-1)
+        x1 = max(x1-int(dx/2),0)
+        x2 = min(x2+int(dx/2),im_w-1)
+        cw,ch = x2-x1, y2-y1
+
+        dx = int((crop_len - cw)/2)
+        dy = int((crop_len - ch)/2)
+
+        cropped = np.zeros(shape=[crop_len, crop_len,3], dtype=np.uint8)
+        cropped[dy:dy+ch, dx:dx+cw] = img[y1:y2, x1:x2]
+
+        cropped = cv2.resize(cropped, (64,64))
+
+
+        pred = classifier.predict(np.expand_dims(cropped, axis=0))
+        masked_faces.append(np.argmax(pred, axis=-1)[0])
+
+    return masked_faces
+
+detector = s3fd('s3fd.pb')
+
+img = plt.imread('/content/drive/My Drive/sample-1.jpg')
+img = resize_with_pad(img)
+
+
+outputs = detector(img)
+faces = prediction_formatting(outputs['scores'], outputs['bboxes'])              
+masked = masker(model, img, faces)
+vis = visualize( img, faces, min_score=0.8, masked=masked
+                )
+
+
+plt.figure(figsize=(20,20))
+plt.imshow(vis)
